@@ -1,0 +1,83 @@
+services:
+  db:
+    image: postgres:15
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-odoo}
+      - POSTGRES_USER=${POSTGRES_USER:-odoo}
+    volumes:
+      - odoo-db-data:/var/lib/postgresql/data
+
+  web:
+    image: odoo:18.0
+    depends_on:
+      - db
+    ports:
+      - "8069:8069"
+    volumes:
+      - odoo-web-data:/var/lib/odoo
+      - ./addons:/mnt/extra-addons
+    environment:
+      - HOST=db
+      - USER=${POSTGRES_USER:-odoo}
+      - PASSWORD=${POSTGRES_PASSWORD:-odoo}
+
+  api:
+    build:
+      context: ./Restaurent_api
+    volumes:
+      - ./Restaurent_api:/app
+    environment:
+      - ODOO_URL=${ODOO_URL:-http://web:8069}
+      - ODOO_DB=${ODOO_DB:-admin}
+      - ODOO_USER=${ODOO_USER:-api_user}
+      - ODOO_PASSWORD=${ODOO_PASSWORD:-api_password_123}
+    ports:
+      - "8000:8000"
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  school-api:
+    build:
+      context: ./School_api
+    volumes:
+      - ./School_api:/app
+    environment:
+      - ODOO_URL=${ODOO_URL:-http://web:8069}
+      - ODOO_DB=${ODOO_DB:-admin}
+      - ODOO_USER=${ODOO_USER:-api_user}
+      - ODOO_PASSWORD=${ODOO_PASSWORD:-api_password_123}
+    ports:
+      - "8001:8001"
+    command: uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+
+  hospital-api:
+    build:
+      context: ./Hospital_api
+    volumes:
+      - ./Hospital_api:/app
+    environment:
+      - ODOO_URL=${ODOO_URL:-http://web:8069}
+      - ODOO_DB=${ODOO_DB:-admin}
+      - ODOO_USER=${ODOO_USER:-api_user}
+      - ODOO_PASSWORD=${ODOO_PASSWORD:-api_password_123}
+    ports:
+      - "8002:8002"
+    command: uvicorn main:app --host 0.0.0.0 --port 8002 --reload
+
+  realestate-api:
+    build:
+      context: ./RealEstate_api
+    volumes:
+      - ./RealEstate_api:/app
+    environment:
+      - ODOO_URL=${ODOO_URL:-http://web:8069}
+      - ODOO_DB=${ODOO_DB:-admin}
+      - ODOO_USER=${ODOO_USER:-api_user}
+      - ODOO_PASSWORD=${ODOO_PASSWORD:-api_password_123}
+    ports:
+      - "8003:8003"
+    command: uvicorn main:app --host 0.0.0.0 --port 8003 --reload
+
+volumes:
+  odoo-db-data:
+  odoo-web-data:
