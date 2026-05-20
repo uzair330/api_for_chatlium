@@ -1,12 +1,12 @@
 # Odoo-FastAPI Restaurant Bridge Documentation
 
-This document provides a detailed reference for the FastAPI bridge that connects external services (like WhatsApp or web apps) to the Odoo 18.0 ERP.
+This document provides a detailed reference for the FastAPI bridge that connects external services (like WhatsApp or web apps) to the Odoo 19.0 ERP.
 
 ---
 
 ## 🛠️ System Architecture
 
-- **Backend**: Odoo 18.0 (Internal service `web:8069`)
+- **Backend**: Odoo 19.0 (Internal service `web:8069`)
 - **API Bridge**: FastAPI (Internal service `api:8000`)
 - **Auth**: JWT (JSON Web Tokens) with Access/Refresh cycle.
 - **Protocol**: XML-RPC (Communication between FastAPI and Odoo)
@@ -91,7 +91,7 @@ Exchange a valid refresh token for a new access token.
 
 ---
 
-## 🥗 Combo Meals & Choices (Odoo 18)
+## 🥗 Combo Meals & Choices
 
 ### List Combo Products
 - **Endpoint**: `GET /pos/combos`

@@ -1,5 +1,57 @@
+# Environment files
 .env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+wheels/
+*.egg-info/
+
+# Virtual environments
 .venv/
+venv/
+env/
+
+# Keep uv lockfiles committed; Docker builds depend on them.
+!uv.lock
+!*/uv.lock
+
+# Logs and runtime files
+*.log
+*.pid
+*.seed
+seed_log.txt
+
+# Local Docker/Odoo volumes and filestore data
 odoo-db-data/
 odoo-web-data/
+filestore/
+sessions/
+addons/*/__pycache__/
+
+# IDE/editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Google Cloud local config/export files
+*.env.yaml
+*.env.yml
+service-account*.json
+*-service-account.json

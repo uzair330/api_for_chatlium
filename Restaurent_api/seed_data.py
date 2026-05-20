@@ -44,7 +44,7 @@ def seed_test_data():
             product_ids[p['name']] = p_id
             print(f"Created Product: {p['name']} (ID: {p_id})")
 
-        # 3. Create Odoo 18 Combo Choices
+        # 3. Create Odoo Combo Choices
         # Choice 1: The Main Drink
         drink_combo_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.combo', 'create', [{
             'name': 'Select Your Drink',
@@ -75,7 +75,7 @@ def seed_test_data():
         }])
         print(f"Created Test Customer: Test User (ID: {partner_id}, Phone: +123456789)")
 
-        print("\nSeed successful! Advanced Odoo 18 features (Combos) are now available.")
+        print("\nSeed successful! Advanced Odoo features (Combos) are now available.")
 
     except Exception as e:
         print(f"Error seeding data: {e}")

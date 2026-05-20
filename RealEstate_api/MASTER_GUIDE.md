@@ -1,7 +1,7 @@
 # Real Estate & Property API: Technical Master Guide
 
 ## 📌 Project Overview
-The **Real Estate API** is a specialized FastAPI service designed to bridge modern property management workflows with the **Odoo 18.0** enterprise engine. It enables property dealers to list assets, track agents, and manage customer leads seamlessly.
+The **Real Estate API** is a specialized FastAPI service designed to bridge modern property management workflows with the **Odoo 19.0** enterprise engine. It enables property dealers to list assets, track agents, and manage customer leads seamlessly.
 
 ## 🏗 Architectural Blueprint
 

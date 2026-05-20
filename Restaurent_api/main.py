@@ -186,7 +186,7 @@ def create_order(order: POSOrderRequest, user=Depends(get_current_user)):
         }
         if item.note:
             line['note'] = item.note
-        # Handle combo choices if applicable (Odoo 18 structure)
+        # Handle combo choices if applicable.
         if item.combo_choices:
             line['combo_line_ids'] = [(4, choice_id) for choice_id in item.combo_choices]
         
@@ -197,7 +197,7 @@ def create_order(order: POSOrderRequest, user=Depends(get_current_user)):
 
 @app.get("/pos/combos", tags=["Product Catalog"])
 def get_combos(user=Depends(get_current_user)):
-    """Fetch products that are part of a combo (Odoo 18)"""
+    """Fetch products that are part of a combo."""
     uid, models = get_odoo_models()
     return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'search_read',
         [[['available_in_pos', '=', True], ['type', '=', 'combo']]], 

@@ -13,7 +13,7 @@
 Client (App/WhatsApp)
        │
        ▼
-FastAPI Bridge (Port 8001)   ──►   Odoo 18.0 (Port 8069)
+FastAPI Bridge (Port 8001)   ──►   Odoo 19.0 (Port 8069)
  - JWT Authentication                - res.partner (Students/Teachers)
  - Role-Based Access                 - slide.channel (LMS Courses)
  - XML-RPC calls                     - slide.slide (Lessons)

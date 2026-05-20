@@ -1,6 +1,6 @@
 # School Management API
 
-A FastAPI bridge for Odoo 18 School Management.
+A FastAPI bridge for Odoo 19.0 School Management.
 
 ## Quick Start
 

@@ -7,6 +7,8 @@ WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1
 # Copy from the cache instead of linking
 ENV UV_LINK_MODE=copy
+# Keep the virtual environment outside /app so compose bind mounts do not hide it.
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 
 # Install dependencies
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -20,10 +22,10 @@ FROM python:3.12-slim-bookworm
 WORKDIR /app
 
 # Copy the virtual environment from the builder
-COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /opt/venv /opt/venv
 
 # Set environment variables
-ENV PATH="/app/.venv/bin:$PATH"
+ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 

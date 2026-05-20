@@ -1,6 +1,6 @@
 # Odoo Restaurant POS Bridge
 
-This service provides a secure, bi-directional bridge between **Odoo 18.0** and external applications (like WhatsApp bots or custom web apps) using FastAPI and JWT tokens.
+This service provides a secure, bi-directional bridge between **Odoo 19.0** and external applications (like WhatsApp bots or custom web apps) using FastAPI and JWT tokens.
 
 ## 🚀 Quick Start
 
@@ -29,7 +29,7 @@ Detailed documentation for all authentication modes, POS operations, and search 
 
 ## 🛠️ Technology Stack
 
-- **Backend**: Odoo 18.0 / PostgreSQL 15
+- **Backend**: Odoo 19.0 / PostgreSQL 15
 - **Bridge**: FastAPI / Python 3.12
 - **Auth**: PyJWT (Access & Refresh tokens)
 - **Package Manager**: uv

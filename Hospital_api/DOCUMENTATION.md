@@ -1,6 +1,6 @@
 # Hospital Management API v1.0
 
-This is a production-ready Hospital Management API integrated with **Odoo 18.0**. It handles clinical workflows, patient management, and doctor scheduling.
+This is a production-ready Hospital Management API integrated with **Odoo 19.0**. It handles clinical workflows, patient management, and doctor scheduling.
 
 ---
 

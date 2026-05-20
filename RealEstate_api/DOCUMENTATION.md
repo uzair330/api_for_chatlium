@@ -1,6 +1,6 @@
 # Real Estate & Property API v1.0
 
-This API is designed for Property Dealers and Real Estate agencies, integrated with **Odoo 18.0**.
+This API is designed for Property Dealers and Real Estate agencies, integrated with **Odoo 19.0**.
 
 ---
 
