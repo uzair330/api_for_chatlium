@@ -32,8 +32,6 @@ services:
       - ODOO_DB=${ODOO_DB:-admin}
       - ODOO_USER=${ODOO_USER:-api_user}
       - ODOO_PASSWORD=${ODOO_PASSWORD:-api_password_123}
-      - JWT_SECRET=${JWT_SECRET:-supersecret123}
-      - SECRET_KEY=${SECRET_KEY:-supersecret123}
     ports:
       - "8000:8000"
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
@@ -48,8 +46,6 @@ services:
       - ODOO_DB=${ODOO_DB:-admin}
       - ODOO_USER=${ODOO_USER:-api_user}
       - ODOO_PASSWORD=${ODOO_PASSWORD:-api_password_123}
-      - JWT_SECRET=${JWT_SECRET:-supersecret123}
-      - SECRET_KEY=${SECRET_KEY:-supersecret123}
     ports:
       - "8001:8001"
     command: uvicorn main:app --host 0.0.0.0 --port 8001 --reload
@@ -64,8 +60,6 @@ services:
       - ODOO_DB=${ODOO_DB:-admin}
       - ODOO_USER=${ODOO_USER:-api_user}
       - ODOO_PASSWORD=${ODOO_PASSWORD:-api_password_123}
-      - JWT_SECRET=${JWT_SECRET:-supersecret123}
-      - SECRET_KEY=${SECRET_KEY:-supersecret123}
     ports:
       - "8002:8002"
     command: uvicorn main:app --host 0.0.0.0 --port 8002 --reload
@@ -80,8 +74,6 @@ services:
       - ODOO_DB=${ODOO_DB:-admin}
       - ODOO_USER=${ODOO_USER:-api_user}
       - ODOO_PASSWORD=${ODOO_PASSWORD:-api_password_123}
-      - JWT_SECRET=${JWT_SECRET:-supersecret123}
-      - SECRET_KEY=${SECRET_KEY:-supersecret123}
     ports:
       - "8003:8003"
     command: uvicorn main:app --host 0.0.0.0 --port 8003 --reload
