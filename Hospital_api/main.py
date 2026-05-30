@@ -1,6 +1,5 @@
 import os
-import xmlrpc.client
-import jwt
+import requests
 import datetime
 import logging
 from typing import List, Optional
@@ -31,20 +30,13 @@ logger = logging.getLogger(__name__)
 # Configuration
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
-ODOO_USER = os.getenv("ODOO_USER")
-ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
-JWT_SECRET = os.getenv("JWT_SECRET")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
-REFRESH_TOKEN_EXPIRE_DAYS = 7
 
 # ===========================================================================
 # --- Pydantic Models ---
 # ===========================================================================
 
 class Token(BaseModel):
-    access_token: str
-    refresh_token: str
+    session_id: str
     token_type: str
 
 class LoginRequest(BaseModel):
@@ -114,94 +106,81 @@ class SupportTicket(BaseModel):
     related_id: Optional[int] = None # Patient or Appointment ID
 
 # ===========================================================================
-# --- Core Helpers ---
+# --- Core Native Auth Helpers ---
 # ===========================================================================
 
-def get_odoo_models(user=None, password=None):
+def get_current_session(auth: HTTPAuthorizationCredentials = Security(security)):
+    return auth.credentials
+
+def odoo_call_kw(model, method, args=[], kwargs={}, session_id=None):
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "model": model,
+            "method": method,
+            "args": args,
+            "kwargs": kwargs
+        }
+    }
+    cookies = {"session_id": session_id} if session_id else {}
     try:
-        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
-        login = user or ODOO_USER
-        pwd = password or ODOO_PASSWORD
-        uid = common.authenticate(ODOO_DB, login, pwd, {})
-        if not uid:
-            return None, None
-        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
-        return uid, models
-    except Exception as e:
+        res = requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=payload, cookies=cookies)
+        res_data = res.json()
+        if "error" in res_data:
+            err_msg = res_data["error"].get("data", {}).get("message", "Access Denied by Odoo")
+            logger.error(f"Odoo Access Error: {err_msg}")
+            raise HTTPException(status_code=403, detail=err_msg)
+        return res_data.get("result")
+    except requests.exceptions.RequestException as e:
         logger.error(f"Odoo Connection Error: {e}")
-        return None, None
-
-def create_tokens(subject: str, payload: dict = {}):
-    access_delta = datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    refresh_delta = datetime.timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    data = {"sub": subject, **payload}
-    access_token = jwt.encode({**data, "exp": datetime.datetime.utcnow() + access_delta}, JWT_SECRET, algorithm=ALGORITHM)
-    refresh_token = jwt.encode({**data, "refresh": True, "exp": datetime.datetime.utcnow() + refresh_delta}, JWT_SECRET, algorithm=ALGORITHM)
-    return access_token, refresh_token
-
-def verify_token(token: str):
-    try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 def fix_odoo_str(val):
     return val if isinstance(val, str) else None
 
 import re
 def strip_html(text):
-    """Remove HTML tags returned by Odoo rich-text fields"""
-    if not text:
-        return None
+    if not text: return None
     return re.sub(r'<[^>]+>', '', str(text)).strip() or None
 
-def get_current_user(auth: HTTPAuthorizationCredentials = Security(security)):
-    return verify_token(auth.credentials)
-
-def require_staff(user=Depends(get_current_user)):
-    if user.get("role") != "staff":
-        raise HTTPException(status_code=403, detail="Staff access required")
-    return user
-
-def get_tag_id(models, uid, tag_name):
-    tag_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner.category', 'search', [[['name', '=', tag_name]]])
+def get_tag_id(tag_name, session_id):
+    tag_ids = odoo_call_kw('res.partner.category', 'search', [[['name', '=', tag_name]]], {}, session_id)
     if not tag_ids:
-        return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner.category', 'create', [{'name': tag_name}])
+        return odoo_call_kw('res.partner.category', 'create', [{'name': tag_name}], {}, session_id)
     return tag_ids[0]
 
 # ===========================================================================
 # --- Auth Endpoints ---
 # ===========================================================================
 
-@app.post("/token", response_model=Token, tags=["Auth"])
+@app.post("/login", response_model=Token, tags=["Auth"])
 def login(req: LoginRequest):
-    uid, models = get_odoo_models(req.username, req.password)
-    if not uid:
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "db": ODOO_DB,
+            "login": req.username,
+            "password": req.password
+        }
+    }
+    res = requests.post(f"{ODOO_URL}/web/session/authenticate", json=payload)
+    res_data = res.json()
+    if "error" in res_data or not res_data.get("result", {}).get("uid"):
         raise HTTPException(status_code=401, detail="Invalid Odoo credentials")
-    user_data = models.execute_kw(ODOO_DB, uid, req.password, 'res.users', 'read', [uid], {'fields': ['name', 'login']})
-    access, refresh = create_tokens(str(uid), {"name": user_data[0]['name'], "login": user_data[0]['login'], "role": "staff"})
-    return {"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
-
-@app.post("/refresh", response_model=Token, tags=["Auth"])
-def refresh_token(auth: HTTPAuthorizationCredentials = Security(security)):
-    user = verify_token(auth.credentials)
-    if not user.get("refresh"):
-        raise HTTPException(status_code=401, detail="Not a refresh token")
-    access, refresh = create_tokens(user["sub"], {k: v for k, v in user.items() if k not in ['exp', 'refresh']})
-    return {"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
+    session_id = res.cookies.get("session_id")
+    if not session_id: raise HTTPException(status_code=500, detail="Odoo did not return a session_id")
+    return {"session_id": session_id, "token_type": "bearer"}
 
 # ===========================================================================
 # --- Patient Endpoints ---
 # ===========================================================================
 
 @app.get("/patients", response_model=List[Patient], tags=["Patients"])
-def list_patients(skip: int = 0, limit: int = 20, user=Depends(require_staff)):
-    uid, models = get_odoo_models()
-    tag_id = get_tag_id(models, uid, "Patient")
-    data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'search_read',
-        [[['category_id', 'in', [tag_id]]]],
-        {'fields': ['id', 'name', 'ref', 'email', 'phone', 'comment'], 'offset': skip, 'limit': limit}
-    )
+def list_patients(skip: int = 0, limit: int = 20, session_id: str = Depends(get_current_session)):
+    tag_id = get_tag_id("Patient", session_id)
+    data = odoo_call_kw('res.partner', 'search_read', [[['category_id', 'in', [tag_id]]]], {'fields': ['id', 'name', 'ref', 'email', 'phone', 'comment'], 'offset': skip, 'limit': limit}, session_id)
     return [Patient(
         id=p['id'], name=p['name'], patient_id=fix_odoo_str(p.get('ref')) or "N/A",
         email=fix_odoo_str(p.get('email')), phone=fix_odoo_str(p.get('phone')),
@@ -209,13 +188,12 @@ def list_patients(skip: int = 0, limit: int = 20, user=Depends(require_staff)):
     ) for p in data]
 
 @app.post("/patients", response_model=Patient, tags=["Patients"])
-def create_patient(p: Patient, user=Depends(require_staff)):
-    uid, models = get_odoo_models()
-    tag_id = get_tag_id(models, uid, "Patient")
-    new_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'create', [{
+def create_patient(p: Patient, session_id: str = Depends(get_current_session)):
+    tag_id = get_tag_id("Patient", session_id)
+    new_id = odoo_call_kw('res.partner', 'create', [{
         'name': p.name, 'ref': p.patient_id, 'email': p.email, 'phone': p.phone,
         'comment': p.blood_group, 'category_id': [(4, tag_id)]
-    }])
+    }], {}, session_id)
     p.id = new_id
     return p
 
@@ -224,13 +202,9 @@ def create_patient(p: Patient, user=Depends(require_staff)):
 # ===========================================================================
 
 @app.get("/doctors", response_model=List[Doctor], tags=["Doctors"])
-def list_doctors(user=Depends(get_current_user)):
-    uid, models = get_odoo_models()
-    tag_id = get_tag_id(models, uid, "Doctor")
-    data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'search_read',
-        [[['category_id', 'in', [tag_id]]]],
-        {'fields': ['id', 'name', 'function', 'email', 'phone']}
-    )
+def list_doctors(session_id: str = Depends(get_current_session)):
+    tag_id = get_tag_id("Doctor", session_id)
+    data = odoo_call_kw('res.partner', 'search_read', [[['category_id', 'in', [tag_id]]]], {'fields': ['id', 'name', 'function', 'email', 'phone']}, session_id)
     return [Doctor(
         id=d['id'], name=d['name'], specialty=fix_odoo_str(d.get('function')) or "General Physician",
         email=fix_odoo_str(d.get('email')), phone=fix_odoo_str(d.get('phone'))
@@ -241,29 +215,22 @@ def list_doctors(user=Depends(get_current_user)):
 # ===========================================================================
 
 @app.get("/appointments", response_model=List[Appointment], tags=["Appointments"])
-def list_appointments(user=Depends(get_current_user)):
-    uid, models = get_odoo_models()
-    data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'calendar.event', 'search_read',
-        [[]], {'fields': ['id', 'name', 'start', 'stop', 'partner_ids']}
-    )
+def list_appointments(session_id: str = Depends(get_current_session)):
+    data = odoo_call_kw('calendar.event', 'search_read', [[]], {'fields': ['id', 'name', 'start', 'stop', 'partner_ids']}, session_id)
     res = []
     for a in data:
         p_ids = a.get('partner_ids', [])
         if len(p_ids) >= 2:
-            res.append(Appointment(
-                id=a['id'], name=a['name'], start=a['start'], stop=a['stop'],
-                patient_id=p_ids[0], doctor_id=p_ids[1]
-            ))
+            res.append(Appointment(id=a['id'], name=a['name'], start=a['start'], stop=a['stop'], patient_id=p_ids[0], doctor_id=p_ids[1]))
     return res
 
 @app.post("/appointments", response_model=Appointment, tags=["Appointments"])
-def create_appointment(a: Appointment, user=Depends(get_current_user)):
-    uid, models = get_odoo_models()
-    new_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'calendar.event', 'create', [{
+def create_appointment(a: Appointment, session_id: str = Depends(get_current_session)):
+    new_id = odoo_call_kw('calendar.event', 'create', [{
         'name': a.name, 'start': a.start.strftime('%Y-%m-%d %H:%M:%S'),
         'stop': a.stop.strftime('%Y-%m-%d %H:%M:%S'),
         'partner_ids': [(6, 0, [a.patient_id, a.doctor_id])]
-    }])
+    }], {}, session_id)
     a.id = new_id
     return a
 
@@ -272,11 +239,8 @@ def create_appointment(a: Appointment, user=Depends(get_current_user)):
 # ===========================================================================
 
 @app.get("/departments", response_model=List[Department], tags=["Departments"])
-def list_departments(user=Depends(get_current_user)):
-    uid, models = get_odoo_models()
-    data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.project', 'search_read',
-        [[]], {'fields': ['id', 'name']}
-    )
+def list_departments(session_id: str = Depends(get_current_session)):
+    data = odoo_call_kw('project.project', 'search_read', [[]], {'fields': ['id', 'name']}, session_id)
     return [Department(id=d['id'], name=d['name']) for d in data]
 
 # ===========================================================================
@@ -284,15 +248,10 @@ def list_departments(user=Depends(get_current_user)):
 # ===========================================================================
 
 @app.get("/lab-reports", response_model=List[LabReport], tags=["Lab Reports"])
-def list_lab_reports(user=Depends(get_current_user)):
-    uid, models = get_odoo_models()
-    # Find project named "Lab Reports"
-    project_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.project', 'search', [[['name', '=', 'Lab Reports']]])
+def list_lab_reports(session_id: str = Depends(get_current_session)):
+    project_ids = odoo_call_kw('project.project', 'search', [[['name', '=', 'Lab Reports']]], {}, session_id)
     if not project_ids: return []
-    
-    data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.task', 'search_read',
-        [[['project_id', '=', project_ids[0]]]], {'fields': ['id', 'partner_id', 'user_ids', 'name', 'description', 'stage_id']}
-    )
+    data = odoo_call_kw('project.task', 'search_read', [[['project_id', '=', project_ids[0]]]], {'fields': ['id', 'partner_id', 'user_ids', 'name', 'description', 'stage_id']}, session_id)
     return [LabReport(
         id=r['id'], patient_id=r['partner_id'][0] if r.get('partner_id') else 0,
         doctor_id=r['user_ids'][0] if r.get('user_ids') else 0,
@@ -305,14 +264,10 @@ def list_lab_reports(user=Depends(get_current_user)):
 # ===========================================================================
 
 @app.get("/opd", response_model=List[OPDRecord], tags=["OPD"])
-def list_opd(user=Depends(get_current_user)):
-    uid, models = get_odoo_models()
-    project_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.project', 'search', [[['name', '=', 'OPD']]])
+def list_opd(session_id: str = Depends(get_current_session)):
+    project_ids = odoo_call_kw('project.project', 'search', [[['name', '=', 'OPD']]], {}, session_id)
     if not project_ids: return []
-    
-    data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.task', 'search_read',
-        [[['project_id', '=', project_ids[0]]]], {'fields': ['id', 'partner_id', 'user_ids', 'project_id', 'name', 'description']}
-    )
+    data = odoo_call_kw('project.task', 'search_read', [[['project_id', '=', project_ids[0]]]], {'fields': ['id', 'partner_id', 'user_ids', 'project_id', 'name', 'description']}, session_id)
     return [OPDRecord(
         id=r['id'], patient_id=r['partner_id'][0] if r.get('partner_id') else 0,
         doctor_id=r['user_ids'][0] if r.get('user_ids') else 0,
@@ -326,14 +281,10 @@ def list_opd(user=Depends(get_current_user)):
 # ===========================================================================
 
 @app.get("/operations", response_model=List[Operation], tags=["Operations"])
-def list_operations(user=Depends(get_current_user)):
-    uid, models = get_odoo_models()
-    project_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.project', 'search', [[['name', '=', 'Operations']]])
+def list_operations(session_id: str = Depends(get_current_session)):
+    project_ids = odoo_call_kw('project.project', 'search', [[['name', '=', 'Operations']]], {}, session_id)
     if not project_ids: return []
-    
-    data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.task', 'search_read',
-        [[['project_id', '=', project_ids[0]]]], {'fields': ['id', 'partner_id', 'user_ids', 'project_id', 'name', 'date_deadline', 'stage_id']}
-    )
+    data = odoo_call_kw('project.task', 'search_read', [[['project_id', '=', project_ids[0]]]], {'fields': ['id', 'partner_id', 'user_ids', 'project_id', 'name', 'date_deadline', 'stage_id']}, session_id)
     return [Operation(
         id=r['id'], patient_id=r['partner_id'][0] if r.get('partner_id') else 0,
         doctor_id=r['user_ids'][0] if r.get('user_ids') else 0,
@@ -347,14 +298,13 @@ def list_operations(user=Depends(get_current_user)):
 # ===========================================================================
 
 @app.get("/dashboard/stats", tags=["Dashboard"])
-def get_stats(user=Depends(require_staff)):
-    uid, models = get_odoo_models()
-    p_tag = get_tag_id(models, uid, "Patient")
-    d_tag = get_tag_id(models, uid, "Doctor")
+def get_stats(session_id: str = Depends(get_current_session)):
+    p_tag = get_tag_id("Patient", session_id)
+    d_tag = get_tag_id("Doctor", session_id)
     return {
-        "patients": models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'search_count', [[['category_id', 'in', [p_tag]]]]),
-        "doctors": models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'search_count', [[['category_id', 'in', [d_tag]]]]),
-        "appointments": models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'calendar.event', 'search_count', [[]])
+        "patients": odoo_call_kw('res.partner', 'search_count', [[['category_id', 'in', [p_tag]]]], {}, session_id),
+        "doctors": odoo_call_kw('res.partner', 'search_count', [[['category_id', 'in', [d_tag]]]], {}, session_id),
+        "appointments": odoo_call_kw('calendar.event', 'search_count', [[]], {}, session_id)
     }
 
 @app.get("/", tags=["Root"])
@@ -364,42 +314,24 @@ def root():
 # --- Customer Support Endpoints (Agent Escalation) ---
 
 @app.post("/support/ticket", tags=["Customer Support"])
-def create_support_ticket(ticket: SupportTicket):
-    """Creates a support ticket in Odoo. Used by WhatsApp Agent for escalation."""
-    uid, models = get_odoo_models()
-    
-    # 1. Ensure Support Project exists
-    project_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.project', 'search', [[['name', '=', 'Hospital Support']]])
+def create_support_ticket(ticket: SupportTicket, session_id: str = Depends(get_current_session)):
+    project_ids = odoo_call_kw('project.project', 'search', [[['name', '=', 'Hospital Support']]], {}, session_id)
     if not project_ids:
-        project_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.project', 'create', [{'name': 'Hospital Support'}])
+        project_id = odoo_call_kw('project.project', 'create', [{'name': 'Hospital Support'}], {}, session_id)
     else:
         project_id = project_ids[0]
 
-    # 2. Create the ticket (Task)
-    task_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.task', 'create', [{
+    task_id = odoo_call_kw('project.task', 'create', [{
         'name': f"[{ticket.issue_type}] {ticket.customer_name}",
         'project_id': project_id,
         'description': f"Phone: {ticket.phone}\nIssue: {ticket.message}\nRelated ID: {ticket.related_id or 'N/A'}",
         'priority': ticket.priority
-    }])
-    
-    return {"status": "ticket_created", "ticket_id": task_id, "message": "Medical staff has been notified for follow-up."}
+    }], {}, session_id)
+    return {"status": "ticket_created", "ticket_id": task_id, "message": "Medical staff has been notified."}
 
 @app.get("/support/my-tickets", tags=["Customer Support"])
-def list_my_tickets(phone: str):
-    """Fetch status of all hospital support tickets associated with a phone number"""
-    uid, models = get_odoo_models()
-    project_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.project', 'search', [[['name', '=', 'Hospital Support']]])
+def list_my_tickets(phone: str, session_id: str = Depends(get_current_session)):
+    project_ids = odoo_call_kw('project.project', 'search', [[['name', '=', 'Hospital Support']]], {}, session_id)
     if not project_ids: return []
-    
-    tasks = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.task', 'search_read',
-        [[['project_id', '=', project_ids[0]], ['description', 'ilike', phone]]],
-        {'fields': ['id', 'name', 'stage_id', 'create_date']}
-    )
-    
-    return [{
-        "ticket_id": t['id'],
-        "subject": t['name'],
-        "status": t['stage_id'][1] if t.get('stage_id') else "New",
-        "created_at": t['create_date']
-    } for t in tasks]
+    tasks = odoo_call_kw('project.task', 'search_read', [[['project_id', '=', project_ids[0]], ['description', 'ilike', phone]]], {'fields': ['id', 'name', 'stage_id', 'create_date']}, session_id)
+    return [{"ticket_id": t['id'], "subject": t['name'], "status": t['stage_id'][1] if t.get('stage_id') else "New", "created_at": t['create_date']} for t in tasks]

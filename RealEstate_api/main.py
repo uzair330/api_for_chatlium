@@ -1,22 +1,19 @@
 import os
-import xmlrpc.client
-import jwt
-import datetime
+import requests
 import logging
-import re
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Depends, Security, Query
+from fastapi import FastAPI, HTTPException, Depends, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+import re
 
 # Load environment variables
 load_dotenv()
 
-app = FastAPI(title="Real Estate Management API", version="1.0.0", description="Odoo-Integrated Property & Real Estate API")
+app = FastAPI(title="Real Estate CRM API", version="1.0.0")
 
-# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,20 +29,13 @@ logger = logging.getLogger(__name__)
 # Configuration
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
-ODOO_USER = os.getenv("ODOO_USER")
-ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
-JWT_SECRET = os.getenv("JWT_SECRET")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
-REFRESH_TOKEN_EXPIRE_DAYS = 7
 
 # ===========================================================================
 # --- Pydantic Models ---
 # ===========================================================================
 
 class Token(BaseModel):
-    access_token: str
-    refresh_token: str
+    session_id: str
     token_type: str
 
 class LoginRequest(BaseModel):
@@ -54,237 +44,183 @@ class LoginRequest(BaseModel):
 
 class Property(BaseModel):
     id: Optional[int] = None
-    name: str
+    name: str  # e.g., "3 BHK Apartment in Downtown"
     price: float
-    property_type: str  # House, Flat, Plot
-    bedrooms: Optional[int] = 0
-    bathrooms: Optional[int] = 0
-    area_sqft: float
-    location: str
-    is_available: bool = True
-
-class Agent(BaseModel):
-    id: Optional[int] = None
-    name: str
-    email: Optional[str] = None
-    phone: Optional[str] = None
+    description: Optional[str] = None
+    status: str = "available"  # available, sold, rented
+    agent_id: Optional[int] = None
 
 class Inquiry(BaseModel):
-    message: Optional[str] = None
+    id: Optional[int] = None
+    customer_name: str
+    phone: str
+    email: Optional[str] = None
+    property_id: Optional[int] = None
+    message: str
     status: str = "new"
 
 class SupportTicket(BaseModel):
     customer_name: str
     phone: str
-    issue_type: str  # e.g., Maintenance, Legal, Viewing Issue
+    issue_type: str  # e.g., Maintenance, Contract, Payment
     message: str
-    priority: str = "0"  # 0: Low, 1: High
-    property_id: Optional[int] = None
+    priority: str = "0"
+    related_property_id: Optional[int] = None
 
 # ===========================================================================
-# --- Core Helpers ---
+# --- Core Native Auth Helpers ---
 # ===========================================================================
 
-def get_odoo_models(user=None, password=None):
+def get_current_session(auth: HTTPAuthorizationCredentials = Security(security)):
+    return auth.credentials
+
+def odoo_call_kw(model, method, args=[], kwargs={}, session_id=None):
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "model": model,
+            "method": method,
+            "args": args,
+            "kwargs": kwargs
+        }
+    }
+    cookies = {"session_id": session_id} if session_id else {}
     try:
-        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
-        login = user or ODOO_USER
-        pwd = password or ODOO_PASSWORD
-        uid = common.authenticate(ODOO_DB, login, pwd, {})
-        if not uid: return None, None
-        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
-        return uid, models
-    except Exception as e:
+        res = requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=payload, cookies=cookies)
+        res_data = res.json()
+        if "error" in res_data:
+            err_msg = res_data["error"].get("data", {}).get("message", "Access Denied by Odoo")
+            logger.error(f"Odoo Access Error: {err_msg}")
+            raise HTTPException(status_code=403, detail=err_msg)
+        return res_data.get("result")
+    except requests.exceptions.RequestException as e:
         logger.error(f"Odoo Connection Error: {e}")
-        return None, None
-
-def create_tokens(subject: str, payload: dict = {}):
-    access_delta = datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    refresh_delta = datetime.timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    data = {"sub": subject, **payload}
-    access_token = jwt.encode({**data, "exp": datetime.datetime.utcnow() + access_delta}, JWT_SECRET, algorithm=ALGORITHM)
-    refresh_token = jwt.encode({**data, "refresh": True, "exp": datetime.datetime.utcnow() + refresh_delta}, JWT_SECRET, algorithm=ALGORITHM)
-    return access_token, refresh_token
-
-def verify_token(token: str):
-    try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-def fix_odoo_str(val):
-    return val if isinstance(val, str) else None
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 def strip_html(text):
     if not text: return None
     return re.sub(r'<[^>]+>', '', str(text)).strip() or None
 
-def get_current_user(auth: HTTPAuthorizationCredentials = Security(security)):
-    return verify_token(auth.credentials)
-
-def require_staff(user=Depends(get_current_user)):
-    # Agent acts as staff for Real Estate
-    if user.get("role") != "agent" and user.get("role") != "staff":
-        raise HTTPException(status_code=403, detail="Agent/Staff access required")
-    return user
-
-def get_tag_id(models, uid, tag_name):
-    tag_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner.category', 'search', [[['name', '=', tag_name]]])
+def get_tag_id(tag_name, session_id):
+    tag_ids = odoo_call_kw('res.partner.category', 'search', [[['name', '=', tag_name]]], {}, session_id)
     if not tag_ids:
-        return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner.category', 'create', [{'name': tag_name}])
+        return odoo_call_kw('res.partner.category', 'create', [{'name': tag_name}], {}, session_id)
     return tag_ids[0]
 
 # ===========================================================================
 # --- Auth Endpoints ---
 # ===========================================================================
 
-@app.post("/token", response_model=Token, tags=["Auth"])
+@app.post("/login", response_model=Token, tags=["Auth"])
 def login(req: LoginRequest):
-    uid, models = get_odoo_models(req.username, req.password)
-    if not uid: raise HTTPException(status_code=401, detail="Invalid Odoo credentials")
-    user_data = models.execute_kw(ODOO_DB, uid, req.password, 'res.users', 'read', [uid], {'fields': ['name', 'login']})
-    access, refresh = create_tokens(str(uid), {"name": user_data[0]['name'], "login": user_data[0]['login'], "role": "agent"})
-    return {"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
-
-@app.post("/refresh", response_model=Token, tags=["Auth"])
-def refresh_token(auth: HTTPAuthorizationCredentials = Security(security)):
-    user = verify_token(auth.credentials)
-    if not user.get("refresh"): raise HTTPException(status_code=401, detail="Not a refresh token")
-    access, refresh = create_tokens(user["sub"], {k: v for k, v in user.items() if k not in ['exp', 'refresh']})
-    return {"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "db": ODOO_DB,
+            "login": req.username,
+            "password": req.password
+        }
+    }
+    res = requests.post(f"{ODOO_URL}/web/session/authenticate", json=payload)
+    res_data = res.json()
+    if "error" in res_data or not res_data.get("result", {}).get("uid"):
+        raise HTTPException(status_code=401, detail="Invalid Odoo credentials")
+    session_id = res.cookies.get("session_id")
+    if not session_id: raise HTTPException(status_code=500, detail="Odoo did not return a session_id")
+    return {"session_id": session_id, "token_type": "bearer"}
 
 # ===========================================================================
-# --- Property Endpoints (Using product.template) ---
+# --- Property Catalog (Products) ---
 # ===========================================================================
 
 @app.get("/properties", response_model=List[Property], tags=["Properties"])
-def list_properties(skip: int = 0, limit: int = 20):
-    uid, models = get_odoo_models()
-    categ_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.category', 'search', [[['name', '=', 'Real Estate']]])
+def list_properties(session_id: str = Depends(get_current_session)):
+    categ_ids = odoo_call_kw('product.category', 'search', [[['name', '=', 'Real Estate']]], {}, session_id)
     if not categ_ids: return []
-    
-    data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.template', 'search_read',
-        [[['categ_id', 'in', categ_ids]]], 
-        {'fields': ['id', 'name', 'list_price', 'description_sale', 'sale_ok'], 'offset': skip, 'limit': limit}
-    )
-    
-    res = []
-    for p in data:
-        desc = fix_odoo_str(p.get('description_sale')) or ""
-        # Mocking parsing bedrooms/bathrooms from description for this implementation
-        res.append(Property(
-            id=p['id'], name=p['name'], price=p['list_price'],
-            property_type="House" if "House" in p['name'] else "Flat",
-            bedrooms=3, bathrooms=2, area_sqft=1500, # Defaulting for now
-            location="Pakistan", is_available=p['sale_ok']
-        ))
-    return res
+    data = odoo_call_kw('product.product', 'search_read', [[['categ_id', '=', categ_ids[0]]]], {'fields': ['id', 'name', 'list_price', 'description_sale']}, session_id)
+    return [Property(
+        id=p['id'], name=p['name'], price=p['list_price'],
+        description=strip_html(p.get('description_sale')), status="available"
+    ) for p in data]
 
 @app.post("/properties", response_model=Property, tags=["Properties"])
-def create_property(p: Property, user=Depends(require_staff)):
-    uid, models = get_odoo_models()
-    categ_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.category', 'search', [[['name', '=', 'Real Estate']]])
+def create_property(p: Property, session_id: str = Depends(get_current_session)):
+    categ_ids = odoo_call_kw('product.category', 'search', [[['name', '=', 'Real Estate']]], {}, session_id)
     if not categ_ids:
-        categ_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.category', 'create', [{'name': 'Real Estate'}])
+        categ_id = odoo_call_kw('product.category', 'create', [{'name': 'Real Estate'}], {}, session_id)
     else:
         categ_id = categ_ids[0]
-        
-    new_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.template', 'create', [{
-        'name': p.name, 'list_price': p.price, 'categ_id': categ_id,
-        'description_sale': f"Type: {p.property_type} | Bedrooms: {p.bedrooms} | Location: {p.location}",
-        'type': 'service', 'sale_ok': True
-    }])
+
+    new_id = odoo_call_kw('product.product', 'create', [{
+        'name': p.name, 'list_price': p.price, 'description_sale': p.description,
+        'type': 'service', 'categ_id': categ_id
+    }], {}, session_id)
     p.id = new_id
     return p
 
 # ===========================================================================
-# --- Inquiry Endpoints (Using crm.lead) ---
+# --- Inquiries (CRM Leads) ---
 # ===========================================================================
 
-@app.get("/inquiries", response_model=List[Inquiry], tags=["Inquiries"])
-def list_inquiries(user=Depends(require_staff)):
-    uid, models = get_odoo_models()
-    data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'crm.lead', 'search_read',
-        [[]], {'fields': ['id', 'contact_name', 'phone', 'description', 'stage_id']}
-    )
-    return [Inquiry(
-        id=i['id'], customer_name=fix_odoo_str(i.get('contact_name')) or "Anonymous",
-        customer_phone=fix_odoo_str(i.get('phone')) or "N/A",
-        property_id=0, # Linked in description or custom field
-        message=strip_html(i.get('description')),
-        status=i.get('stage_id', [None, "new"])[1]
-    ) for i in data]
-
 @app.post("/inquiries", response_model=Inquiry, tags=["Inquiries"])
-def create_inquiry(i: Inquiry):
-    uid, models = get_odoo_models()
-    new_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'crm.lead', 'create', [{
-        'name': f"Inquiry for Property #{i.property_id}",
-        'contact_name': i.customer_name,
-        'phone': i.customer_phone,
-        'description': i.message,
-        'type': 'lead'
-    }])
-    i.id = new_id
-    return i
+def submit_inquiry(inq: Inquiry, session_id: str = Depends(get_current_session)):
+    new_id = odoo_call_kw('crm.lead', 'create', [{
+        'name': f"Inquiry for Property {inq.property_id or 'General'}",
+        'contact_name': inq.customer_name, 'phone': inq.phone,
+        'email_from': inq.email, 'description': inq.message, 'type': 'lead'
+    }], {}, session_id)
+    inq.id = new_id
+    return inq
+
+@app.get("/inquiries", response_model=List[Inquiry], tags=["Inquiries"])
+def list_inquiries(session_id: str = Depends(get_current_session)):
+    data = odoo_call_kw('crm.lead', 'search_read', [[]], {'fields': ['id', 'contact_name', 'phone', 'description', 'stage_id']}, session_id)
+    return [Inquiry(
+        id=l['id'], customer_name=l.get('contact_name') or "Unknown",
+        phone=l.get('phone') or "", message=strip_html(l.get('description')) or "",
+        status=l['stage_id'][1] if l.get('stage_id') else "new"
+    ) for l in data]
 
 # ===========================================================================
 # --- Dashboard ---
 # ===========================================================================
 
 @app.get("/dashboard/stats", tags=["Dashboard"])
-def get_stats(user=Depends(require_staff)):
-    uid, models = get_odoo_models()
-    categ_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.category', 'search', [[['name', '=', 'Real Estate']]])
+def get_stats(session_id: str = Depends(get_current_session)):
+    categ_ids = odoo_call_kw('product.category', 'search', [[['name', '=', 'Real Estate']]], {}, session_id)
     return {
-        "total_properties": models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.template', 'search_count', [[['categ_id', 'in', categ_ids]]]) if categ_ids else 0,
-        "active_inquiries": models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'crm.lead', 'search_count', [[['type', '=', 'lead']]]),
-        "agents": models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'search_count', [[['category_id', 'in', [get_tag_id(models, uid, "Agent")]]]])
+        "total_properties": odoo_call_kw('product.product', 'search_count', [[['categ_id', '=', categ_ids[0]]]] if categ_ids else [[]], {}, session_id),
+        "total_inquiries": odoo_call_kw('crm.lead', 'search_count', [[]], {}, session_id),
+        "won_deals": odoo_call_kw('crm.lead', 'search_count', [[['stage_id.name', 'ilike', 'Won']]], {}, session_id)
     }
 
 @app.get("/", tags=["Root"])
 def root():
-    return {"message": "Welcome to Real Estate & Property API", "docs": "/docs"}
+    return {"message": "Welcome to Real Estate API", "docs": "/docs"}
 
 # --- Customer Support Endpoints (Agent Escalation) ---
 
 @app.post("/support/ticket", tags=["Customer Support"])
-def create_support_ticket(ticket: SupportTicket):
-    """Creates a support ticket in Odoo. Used by WhatsApp Agent for escalation."""
-    uid, models = get_odoo_models()
-    
-    # 1. Ensure Support Project exists
-    project_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.project', 'search', [[['name', '=', 'Real Estate Support']]])
+def create_support_ticket(ticket: SupportTicket, session_id: str = Depends(get_current_session)):
+    project_ids = odoo_call_kw('project.project', 'search', [[['name', '=', 'Real Estate Support']]], {}, session_id)
     if not project_ids:
-        project_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.project', 'create', [{'name': 'Real Estate Support'}])
+        project_id = odoo_call_kw('project.project', 'create', [{'name': 'Real Estate Support'}], {}, session_id)
     else:
         project_id = project_ids[0]
 
-    # 2. Create the ticket (Task)
-    task_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.task', 'create', [{
+    task_id = odoo_call_kw('project.task', 'create', [{
         'name': f"[{ticket.issue_type}] {ticket.customer_name}",
         'project_id': project_id,
-        'description': f"Phone: {ticket.phone}\nIssue: {ticket.message}\nProperty ID: {ticket.property_id or 'N/A'}",
+        'description': f"Phone: {ticket.phone}\nIssue: {ticket.message}\nRelated Property ID: {ticket.related_property_id or 'N/A'}",
         'priority': ticket.priority
-    }])
-    
-    return {"status": "ticket_created", "ticket_id": task_id, "message": "An agent will contact you shortly regarding your request."}
+    }], {}, session_id)
+    return {"status": "ticket_created", "ticket_id": task_id, "message": "An agent will contact you shortly."}
 
 @app.get("/support/my-tickets", tags=["Customer Support"])
-def list_my_tickets(phone: str):
-    """Fetch status of all real estate support tickets associated with a phone number"""
-    uid, models = get_odoo_models()
-    project_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.project', 'search', [[['name', '=', 'Real Estate Support']]])
+def list_my_tickets(phone: str, session_id: str = Depends(get_current_session)):
+    project_ids = odoo_call_kw('project.project', 'search', [[['name', '=', 'Real Estate Support']]], {}, session_id)
     if not project_ids: return []
-    
-    tasks = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.task', 'search_read',
-        [[['project_id', '=', project_ids[0]], ['description', 'ilike', phone]]],
-        {'fields': ['id', 'name', 'stage_id', 'create_date']}
-    )
-    
-    return [{
-        "ticket_id": t['id'],
-        "subject": t['name'],
-        "status": t['stage_id'][1] if t.get('stage_id') else "New",
-        "created_at": t['create_date']
-    } for t in tasks]
+    tasks = odoo_call_kw('project.task', 'search_read', [[['project_id', '=', project_ids[0]], ['description', 'ilike', phone]]], {'fields': ['id', 'name', 'stage_id', 'create_date']}, session_id)
+    return [{"ticket_id": t['id'], "subject": t['name'], "status": t['stage_id'][1] if t.get('stage_id') else "New", "created_at": t['create_date']} for t in tasks]

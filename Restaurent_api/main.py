@@ -1,6 +1,5 @@
 import os
-import xmlrpc.client
-import jwt
+import requests
 import datetime
 from fastapi import FastAPI, HTTPException, Depends, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -12,18 +11,9 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Security Settings
-SECRET_KEY = os.getenv("SECRET_KEY")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
-REFRESH_TOKEN_EXPIRE_DAYS = 7
-
 # Odoo Configuration
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
-# System defaults (for internal admin tasks)
-ODOO_USER = os.getenv("ODOO_USER")
-ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
 
 app = FastAPI(title="Odoo Restaurant POS API")
 security = HTTPBearer()
@@ -32,8 +22,7 @@ logger = logging.getLogger(__name__)
 
 # --- Models ---
 class Token(BaseModel):
-    access_token: str
-    refresh_token: str
+    session_id: str
     token_type: str
 
 class LoginRequest(BaseModel):
@@ -42,139 +31,207 @@ class LoginRequest(BaseModel):
 
 class CustomerLoginRequest(BaseModel):
     phone: str
+    password: str
+
+class CustomerRegisterRequest(BaseModel):
+    name: str
+    phone: str
+    password: str
 
 class POSOrderItem(BaseModel):
     product_id: int
     quantity: float
-    combo_choices: Optional[List[int]] = None  # List of selected product IDs within the combo
+    combo_choices: Optional[List[int]] = None
     note: Optional[str] = None
 
 class POSOrderRequest(BaseModel):
     partner_id: int
     items: List[POSOrderItem]
 
+class LocationRequest(BaseModel):
+    latitude: float
+    longitude: float
+
+class RiderAssignRequest(BaseModel):
+    rider_partner_id: int
+
 class SupportTicket(BaseModel):
     customer_name: str
     phone: str
-    issue_type: str  # e.g., Billing, Food Quality, Technical
+    issue_type: str
     message: str
-    priority: str = "0"  # 0: Low, 1: High
+    priority: str = "0"
     order_id: Optional[int] = None
 
-# --- Auth Helpers ---
-def create_tokens(subject: str, payload: dict = {}):
-    access_delta = datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    refresh_delta = datetime.timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    
-    data = {"sub": subject, **payload}
-    access_token = jwt.encode({**data, "exp": datetime.datetime.utcnow() + access_delta}, SECRET_KEY, algorithm=ALGORITHM)
-    refresh_token = jwt.encode({**data, "refresh": True, "exp": datetime.datetime.utcnow() + refresh_delta}, SECRET_KEY, algorithm=ALGORITHM)
-    
-    return access_token, refresh_token
+# --- Native Odoo Auth Helpers ---
+def get_current_session(auth: HTTPAuthorizationCredentials = Security(security)):
+    """Extracts the Odoo session_id passed in the Authorization Bearer header"""
+    return auth.credentials
 
-def verify_token(token: str):
+def get_current_user_id(session_id: str):
+    """Fetches the user_id (uid) and partner_id of the current session"""
+    res = requests.post(
+        f"{ODOO_URL}/web/session/get_session_info", 
+        json={"jsonrpc": "2.0", "method": "call", "params": {}}, 
+        cookies={"session_id": session_id}
+    )
+    data = res.json().get("result", {})
+    if not data.get("uid"):
+        raise HTTPException(status_code=401, detail="Invalid session")
+    return data.get("uid"), data.get("partner_id")
+
+def odoo_call_kw(model, method, args=[], kwargs={}, session_id=None):
+    """Executes a JSON-RPC call to Odoo using the user's native session"""
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "model": model,
+            "method": method,
+            "args": args,
+            "kwargs": kwargs
+        }
+    }
+    cookies = {"session_id": session_id} if session_id else {}
     try:
-        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-def get_current_user(auth: HTTPAuthorizationCredentials = Security(security)):
-    return verify_token(auth.credentials)
-
-def require_staff(user=Depends(get_current_user)):
-    if user.get("type") != "staff" and user.get("role") != "staff":
-        raise HTTPException(status_code=403, detail="Staff access required")
-    return user
-
-# --- Odoo Helper ---
-def get_odoo_models(user=None, password=None):
-    """Connects to Odoo. Uses provided credentials or system defaults."""
-    try:
-        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
-        login = user or ODOO_USER
-        pwd = password or ODOO_PASSWORD
-        uid = common.authenticate(ODOO_DB, login, pwd, {})
-        if not uid:
-            return None, None
-        return uid, xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
-    except Exception as e:
+        res = requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=payload, cookies=cookies)
+        res_data = res.json()
+        if "error" in res_data:
+            err_msg = res_data["error"].get("data", {}).get("message", "Access Denied by Odoo")
+            logger.error(f"Odoo Access Error: {err_msg}")
+            raise HTTPException(status_code=403, detail=err_msg)
+        return res_data.get("result")
+    except requests.exceptions.RequestException as e:
         logger.error(f"Odoo Connection Error: {e}")
-        return None, None
+        raise HTTPException(status_code=500, detail="Internal Server Error communicating with Odoo")
 
 # --- Endpoints ---
 
-@app.post("/token", response_model=Token, tags=["Authentication"])
+@app.post("/login", response_model=Token, tags=["Authentication"])
 def login(req: LoginRequest):
-    """Authenticates against Odoo's real users (res.users)"""
-    uid, models = get_odoo_models(req.username, req.password)
-    if not uid:
+    """Authenticates natively against Odoo and returns the Odoo session_id"""
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "db": ODOO_DB,
+            "login": req.username,
+            "password": req.password
+        }
+    }
+    res = requests.post(f"{ODOO_URL}/web/session/authenticate", json=payload)
+    res_data = res.json()
+    
+    if "error" in res_data or not res_data.get("result", {}).get("uid"):
         raise HTTPException(status_code=401, detail="Invalid Odoo credentials")
-    
-    # Get user details from Odoo
-    user_data = models.execute_kw(ODOO_DB, uid, req.password, 'res.users', 'read', [uid], {'fields': ['name', 'login']})
-    
-    access, refresh = create_tokens(str(uid), {"name": user_data[0]['name'], "login": user_data[0]['login'], "type": "staff"})
-    return {"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
+        
+    session_id = res.cookies.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=500, detail="Odoo did not return a session_id")
+        
+    return {"session_id": session_id, "token_type": "bearer"}
 
-@app.get("/me", tags=["Authentication"])
-def get_me(user=Depends(get_current_user)):
-    """Verifies the token and returns the logged in user info"""
-    return {
-        "uid": user.get("sub"),
-        "name": user.get("name"),
-        "login": user.get("login"),
-        "type": user.get("type", "customer")
+@app.post("/customer/register", tags=["Customer Authentication"])
+def register_customer(req: CustomerRegisterRequest):
+    """Creates a new Customer (Portal User) in Odoo so they can login natively."""
+    admin_payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {"db": ODOO_DB, "login": os.getenv("ODOO_USER", "admin"), "password": os.getenv("ODOO_PASSWORD", "admin")}
+    }
+    admin_res = requests.post(f"{ODOO_URL}/web/session/authenticate", json=admin_payload)
+    admin_session_id = admin_res.cookies.get("session_id")
+    if not admin_session_id:
+        raise HTTPException(status_code=500, detail="Failed to authenticate admin server-side")
+
+    groups = odoo_call_kw('res.groups', 'search', [[['name', 'ilike', 'Portal']]], {}, admin_session_id)
+    group_id = groups[0] if groups else None
+
+    user_vals = {
+        'name': req.name,
+        'login': req.phone,  # Use phone as login
+        'password': req.password,
+        'phone': req.phone,
     }
 
-@app.post("/refresh", response_model=Token, tags=["Authentication"])
-def refresh_token(auth: HTTPAuthorizationCredentials = Security(security)):
-    """Exchanges a valid Refresh Token for a new set of tokens"""
-    user = verify_token(auth.credentials)
-    
-    if not user.get("refresh"):
-        raise HTTPException(status_code=401, detail="This is not a refresh token")
-    
-    # Generate new tokens
-    access, refresh = create_tokens(user["sub"], {
-        "name": user.get("name"),
-        "login": user.get("login"),
-        "type": user.get("type")
-    })
-    return {"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
+    try:
+        # Create user without groups_id first to avoid ValueError
+        user_id = odoo_call_kw('res.users', 'create', [user_vals], {}, admin_session_id)
+        
+        # Try to assign portal group via write, ignore if field doesn't exist
+        if group_id:
+            try:
+                odoo_call_kw('res.users', 'write', [[user_id], {'groups_id': [(4, group_id)]}], {}, admin_session_id)
+            except Exception:
+                pass
+                
+    except HTTPException as e:
+        if "Duplicate" in str(e.detail) or "already exists" in str(e.detail):
+            raise HTTPException(status_code=400, detail="Phone number already registered.")
+        raise e
 
-@app.post("/customer/login", response_model=Token, tags=["Authentication"])
+    return {"status": "success", "user_id": user_id, "message": "Customer registered successfully. You can now login via /customer/login."}
+
+@app.post("/customer/login", response_model=Token, tags=["Customer Authentication"])
 def customer_login(req: CustomerLoginRequest):
-    """Customer login via phone number lookup"""
-    uid, models = get_odoo_models()
-    partner = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'search_read',
-        [[['phone', '=', req.phone]]], {'limit': 1, 'fields': ['id', 'name']})
+    """Customer login expects the phone number (login) and password."""
+    # Under the hood, this is the exact same native Odoo session authentication as /login
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "db": ODOO_DB,
+            "login": req.phone,  # login is the phone number
+            "password": req.password
+        }
+    }
+    res = requests.post(f"{ODOO_URL}/web/session/authenticate", json=payload)
+    res_data = res.json()
     
-    if not partner:
-        raise HTTPException(status_code=404, detail="Customer phone not found")
-    
-    access, refresh = create_tokens(str(partner[0]['id']), {"name": partner[0]['name'], "type": "customer"})
-    return {"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
+    if "error" in res_data or not res_data.get("result", {}).get("uid"):
+        raise HTTPException(status_code=401, detail="Invalid phone number or password")
+        
+    session_id = res.cookies.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=500, detail="Odoo did not return a session_id")
+        
+    return {"session_id": session_id, "token_type": "bearer"}
+
+@app.get("/me", tags=["Authentication"])
+def get_me(session_id: str = Depends(get_current_session)):
+    """Verifies the session and returns user info using native Odoo session"""
+    uid, partner_id = get_current_user_id(session_id)
+    return {"uid": uid, "partner_id": partner_id}
+
+@app.put("/me/location", tags=["Delivery & Tracking"])
+def update_my_location(loc: LocationRequest, session_id: str = Depends(get_current_session)):
+    """Updates the latitude/longitude for the currently authenticated user/rider"""
+    uid, partner_id = get_current_user_id(session_id)
+    # Using partner_latitude and partner_longitude. Ensure Odoo base_geolocalize is installed if these throw an error.
+    try:
+        odoo_call_kw('res.partner', 'write', [[partner_id], {
+            'partner_latitude': loc.latitude, 
+            'partner_longitude': loc.longitude
+        }], {}, session_id)
+        return {"status": "success", "message": "Location updated successfully"}
+    except Exception as e:
+        logger.error(f"Error updating geolocation (is base_geolocalize module installed in Odoo?): {e}")
+        raise HTTPException(status_code=400, detail="Could not update geolocation. Ensure 'Partner Geolocation' app is installed in Odoo.")
 
 @app.get("/pos/categories", tags=["POS Operations"])
-def get_categories(user=Depends(get_current_user)):
-    uid, models = get_odoo_models()
-    return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'pos.category', 'search_read', [], {'fields': ['id', 'name']})
+def get_categories(session_id: str = Depends(get_current_session)):
+    return odoo_call_kw('pos.category', 'search_read', [], {'fields': ['id', 'name']}, session_id)
 
 @app.get("/pos/products", tags=["Product Catalog"])
-def get_products(category_id: Optional[int] = None, user=Depends(get_current_user)):
-    uid, models = get_odoo_models()
+def get_products(category_id: Optional[int] = None, session_id: str = Depends(get_current_session)):
     domain = [[['available_in_pos', '=', True]]]
     if category_id:
         domain[0].append(['pos_categ_ids', 'in', [category_id]])
-    
-    return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'search_read',
-        domain, {'fields': ['id', 'display_name', 'list_price']})
+    return odoo_call_kw('product.product', 'search_read', domain, {'fields': ['id', 'display_name', 'list_price']}, session_id)
 
 @app.post("/pos/order", tags=["POS Operations"])
-def create_order(order: POSOrderRequest, user=Depends(get_current_user)):
-    uid, models = get_odoo_models()
-    sessions = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'pos.session', 'search_read',
-        [[['state', '=', 'opened']]], {'limit': 1, 'fields': ['id']})
+def create_order(order: POSOrderRequest, session_id: str = Depends(get_current_session)):
+    sessions = odoo_call_kw('pos.session', 'search_read', [[['state', '=', 'opened']]], {'limit': 1, 'fields': ['id']}, session_id)
     if not sessions:
         raise HTTPException(status_code=400, detail="No open POS session found.")
 
@@ -189,66 +246,125 @@ def create_order(order: POSOrderRequest, user=Depends(get_current_user)):
             'product_id': item.product_id,
             'qty': item.quantity,
         }
-        if item.note:
-            line['note'] = item.note
-        # Handle combo choices if applicable.
+        if item.note: line['note'] = item.note
         if item.combo_choices:
             line['combo_line_ids'] = [(4, choice_id) for choice_id in item.combo_choices]
-        
         order_payload['lines'].append((0, 0, line))
 
-    order_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'pos.order', 'create', [order_payload])
+    order_id = odoo_call_kw('pos.order', 'create', [order_payload], {}, session_id)
     return {"status": "success", "order_id": order_id}
 
+@app.post("/delivery/{order_id}/assign_rider", tags=["Delivery & Tracking"])
+def assign_rider_to_order(order_id: int, req: RiderAssignRequest, session_id: str = Depends(get_current_session)):
+    """Assigns a rider to an order by creating a Delivery Task in Odoo's Project app natively"""
+    # Verify order exists
+    order = odoo_call_kw('pos.order', 'read', [order_id], {'fields': ['name', 'partner_id']}, session_id)
+    if not order: raise HTTPException(status_code=404, detail="Order not found")
+
+    # Find or create a Deliveries project
+    project_ids = odoo_call_kw('project.project', 'search', [[['name', '=', 'Food Deliveries']]], {}, session_id)
+    if not project_ids:
+        project_id = odoo_call_kw('project.project', 'create', [{'name': 'Food Deliveries'}], {}, session_id)
+    else:
+        project_id = project_ids[0]
+
+    # Create Delivery Task and assign Rider
+    task_id = odoo_call_kw('project.task', 'create', [{
+        'name': f"Delivery for {order[0]['name']} (Order #{order_id})",
+        'project_id': project_id,
+        'partner_id': order[0]['partner_id'][0] if order[0]['partner_id'] else False,
+        'description': f"Link: {order_id}",
+        # In Odoo 16+, user_ids is the assignee. Since riders might only be partners in our setup, 
+        # let's just log them in the description or a custom tag to avoid complex HR/User logic for now.
+        # But wait, we can assign tags. Let's just create it and tag it with the rider's name.
+    }], {}, session_id)
+
+    # Note: Odoo tasks usually assign to res.users, not res.partner. 
+    # To keep it completely standard, we store the rider's partner_id in the task description to parse it back.
+    odoo_call_kw('project.task', 'write', [[task_id], {
+        'description': f"ORDER_ID:{order_id}\nRIDER_PARTNER_ID:{req.rider_partner_id}"
+    }], {}, session_id)
+
+    return {"status": "success", "task_id": task_id, "message": f"Rider assigned to order {order_id}"}
+
+@app.get("/delivery/track/{order_id}", tags=["Delivery & Tracking"])
+def track_delivery(order_id: int, session_id: str = Depends(get_current_session)):
+    """Comprehensive tracking endpoint returning Order Status, Customer Lat/Long, and Rider Lat/Long for Map rendering."""
+    # 1. Get Order details
+    order = odoo_call_kw('pos.order', 'read', [order_id], {'fields': ['state', 'amount_total', 'partner_id']}, session_id)
+    if not order: raise HTTPException(status_code=404, detail="Order not found")
+    
+    response = {
+        "order_id": order_id,
+        "status": order[0]['state'],
+        "total": order[0]['amount_total'],
+        "customer_location": None,
+        "rider_location": None,
+        "rider_assigned": False
+    }
+
+    # 2. Get Customer Location
+    if order[0].get('partner_id'):
+        customer_id = order[0]['partner_id'][0]
+        customer = odoo_call_kw('res.partner', 'read', [customer_id], {'fields': ['partner_latitude', 'partner_longitude']}, session_id)
+        if customer and customer[0].get('partner_latitude'):
+            response["customer_location"] = {
+                "lat": customer[0]['partner_latitude'],
+                "lng": customer[0]['partner_longitude']
+            }
+
+    # 3. Check for Delivery Task (to find assigned Rider)
+    tasks = odoo_call_kw('project.task', 'search_read', [[['name', 'ilike', f"Order #{order_id}"]]], {'fields': ['description']}, session_id)
+    if tasks and tasks[0].get('description'):
+        desc = tasks[0]['description']
+        # Extract RIDER_PARTNER_ID from description block
+        if "RIDER_PARTNER_ID:" in desc:
+            rider_id_str = desc.split("RIDER_PARTNER_ID:")[1].split("\n")[0].strip()
+            try:
+                rider_id = int(rider_id_str)
+                rider = odoo_call_kw('res.partner', 'read', [rider_id], {'fields': ['name', 'partner_latitude', 'partner_longitude', 'phone']}, session_id)
+                if rider:
+                    response["rider_assigned"] = True
+                    response["rider_details"] = {"name": rider[0]['name'], "phone": rider[0].get('phone')}
+                    if rider[0].get('partner_latitude'):
+                        response["rider_location"] = {
+                            "lat": rider[0]['partner_latitude'],
+                            "lng": rider[0]['partner_longitude']
+                        }
+            except ValueError:
+                pass
+
+    return response
+
 @app.get("/pos/combos", tags=["Product Catalog"])
-def get_combos(user=Depends(get_current_user)):
-    """Fetch products that are part of a combo."""
-    uid, models = get_odoo_models()
-    return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'search_read',
-        [[['available_in_pos', '=', True], ['type', '=', 'combo']]], 
-        {'fields': ['id', 'display_name', 'list_price']})
+def get_combos(session_id: str = Depends(get_current_session)):
+    return odoo_call_kw('product.product', 'search_read', [[['available_in_pos', '=', True], ['type', '=', 'combo']]], {'fields': ['id', 'display_name', 'list_price']}, session_id)
 
 @app.get("/pos/combos/{product_id}/choices", tags=["Product Catalog"])
-def get_combo_choices(product_id: int, user=Depends(get_current_user)):
-    """Fetch the available options for a specific combo product"""
-    uid, models = get_odoo_models()
-    product = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read', 
-        [product_id], {'fields': ['combo_ids']})
-    
+def get_combo_choices(product_id: int, session_id: str = Depends(get_current_session)):
+    product = odoo_call_kw('product.product', 'read', [product_id], {'fields': ['combo_ids']}, session_id)
     if not product or not product[0].get('combo_ids'):
         raise HTTPException(status_code=404, detail="No combo choices found for this product")
 
-    combos = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'pos.combo', 'read',
-        [product[0]['combo_ids']], {'fields': ['id', 'name', 'combo_line_ids']})
+    combos = odoo_call_kw('pos.combo', 'read', [product[0]['combo_ids']], {'fields': ['id', 'name', 'combo_line_ids']}, session_id)
     
     result = []
     for combo in combos:
-        lines = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'pos.combo.line', 'read',
-            [combo['combo_line_ids']], {'fields': ['product_id', 'extra_price']})
-        
+        lines = odoo_call_kw('pos.combo.line', 'read', [combo['combo_line_ids']], {'fields': ['product_id', 'extra_price']}, session_id)
         result.append({
             "combo_id": combo['id'],
             "name": combo['name'],
             "choices": [{"id": l['product_id'][0], "name": l['product_id'][1], "extra_price": l['extra_price']} for l in lines]
         })
-    
     return result
 
 @app.get("/customer/loyalty", tags=["Customer & Loyalty"])
-def get_loyalty_points(user=Depends(get_current_user)):
-    """Fetch loyalty points for the logged-in customer"""
-    uid, models = get_odoo_models()
-    partner_id = int(user.get("sub"))
-    
-    cards = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'loyalty.card', 'search_read',
-        [[['partner_id', '=', partner_id]]], {'fields': ['points', 'program_id', 'code']})
-    
-    if not cards:
-        return {"points": 0, "rewards": [], "message": "No loyalty card found"}
+def get_loyalty_points(partner_id: int, session_id: str = Depends(get_current_session)):
+    cards = odoo_call_kw('loyalty.card', 'search_read', [[['partner_id', '=', partner_id]]], {'fields': ['points', 'program_id', 'code']}, session_id)
+    if not cards: return {"points": 0, "rewards": [], "message": "No loyalty card found"}
 
     program_ids = [c['program_id'][0] for c in cards]
-    rewards = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'loyalty.reward', 'search_read',
-        [[['program_id', 'in', program_ids]]], {'fields': ['id', 'description', 'required_points']})
+    rewards = odoo_call_kw('loyalty.reward', 'search_read', [[['program_id', 'in', program_ids]]], {'fields': ['id', 'description', 'required_points']}, session_id)
 
     return {
         "points": sum(c['points'] for c in cards),
@@ -256,117 +372,18 @@ def get_loyalty_points(user=Depends(get_current_user)):
         "available_rewards": rewards
     }
 
-@app.get("/customers/search", tags=["Search"])
-def search_customers(query: str, user=Depends(require_staff)):
-    """Search for customers by name, email, or phone (Staff Only)"""
-    uid, models = get_odoo_models()
-    domain = ['|', '|', 
-              ['name', 'ilike', query], 
-              ['email', 'ilike', query], 
-              ['phone', 'ilike', query]]
-    return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'search_read',
-        [domain], {'fields': ['id', 'name', 'email', 'phone'], 'limit': 20})
-
-@app.get("/products/search", tags=["Search"])
-def search_products(query: str, user=Depends(get_current_user)):
-    """Search for POS-enabled products by name or internal reference"""
-    uid, models = get_odoo_models()
-    domain = [['available_in_pos', '=', True], 
-              '|', 
-              ['name', 'ilike', query], 
-              ['default_code', 'ilike', query]]
-    return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'search_read',
-        [domain], {'fields': ['id', 'display_name', 'list_price'], 'limit': 20})
-
-@app.get("/orders/search", tags=["Search"])
-def search_orders(partner_id: Optional[int] = None, reference: Optional[str] = None, user=Depends(get_current_user)):
-    """Search for POS orders by partner or reference. Customers can only see their own orders."""
-    # Enforce RBAC: If customer, they MUST only query their own partner_id
-    if user.get("type") != "staff" and user.get("role") != "staff":
-        if not partner_id or str(partner_id) != user.get("sub"):
-            raise HTTPException(status_code=403, detail="You can only search for your own orders")
-    uid, models = get_odoo_models()
-    domain = []
-    if partner_id:
-        domain.append(['partner_id', '=', partner_id])
-    if reference:
-        domain.append(['name', 'ilike', reference])
-    
-    return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'pos.order', 'search_read',
-        [domain], {'fields': ['id', 'name', 'date_order', 'amount_total', 'state'], 'limit': 20})
-
-
-@app.put("/delivery/address", tags=["Customer & Loyalty"])
-def update_delivery_address(partner_id: int, address: str, user=Depends(get_current_user)):
-    """Updates the customer's address in Odoo"""
-    uid, models = get_odoo_models()
-    models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'write', [[partner_id], {
-        'street': address
-    }])
-    return {"status": "success", "message": "Address updated"}
-
-@app.get("/delivery/track/{order_id}", tags=["Customer & Loyalty"])
-def track_delivery(order_id: int, user=Depends(get_current_user)):
-    """Detailed delivery tracking based on POS order state"""
-    uid, models = get_odoo_models()
-    order = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'pos.order', 'read', [order_id], {'fields': ['state', 'amount_total']})
-    
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-    
-    # Simple status mapping for restaurant delivery
-    statuses = {
-        'draft': 'Cooking in Kitchen 👨‍🍳',
-        'paid': 'Food is Ready! 📦',
-        'done': 'Out for Delivery 🛵',
-        'invoiced': 'Delivered! Enjoy your meal 🍕'
-    }
-    
-    return {
-        "order_id": order_id,
-        "status": statuses.get(order[0]['state'], "Processing"),
-        "total": order[0]['amount_total']
-    }
-
-# --- Customer Support Endpoints (Agent Escalation) ---
-
 @app.post("/support/ticket", tags=["Customer Support"])
-def create_support_ticket(ticket: SupportTicket):
-    """Creates a support ticket in Odoo. Used by WhatsApp Agent for escalation."""
-    uid, models = get_odoo_models()
-    
-    # 1. Ensure Support Project exists
-    project_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.project', 'search', [[['name', '=', 'Restaurant Support']]])
+def create_support_ticket(ticket: SupportTicket, session_id: str = Depends(get_current_session)):
+    project_ids = odoo_call_kw('project.project', 'search', [[['name', '=', 'Restaurant Support']]], {}, session_id)
     if not project_ids:
-        project_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.project', 'create', [{'name': 'Restaurant Support'}])
+        project_id = odoo_call_kw('project.project', 'create', [{'name': 'Restaurant Support'}], {}, session_id)
     else:
         project_id = project_ids[0]
 
-    # 2. Create the ticket (Task)
-    task_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.task', 'create', [{
+    task_id = odoo_call_kw('project.task', 'create', [{
         'name': f"[{ticket.issue_type}] {ticket.customer_name}",
         'project_id': project_id,
         'description': f"Phone: {ticket.phone}\nIssue: {ticket.message}\nRelated Order ID: {ticket.order_id or 'N/A'}",
         'priority': ticket.priority
-    }])
-    
+    }], {}, session_id)
     return {"status": "ticket_created", "ticket_id": task_id, "message": "A support agent will follow up shortly."}
-
-@app.get("/support/my-tickets", tags=["Customer Support"])
-def list_my_tickets(phone: str):
-    """Fetch status of all tickets associated with a phone number"""
-    uid, models = get_odoo_models()
-    project_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.project', 'search', [[['name', '=', 'Restaurant Support']]])
-    if not project_ids: return []
-    
-    tasks = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'project.task', 'search_read',
-        [[['project_id', '=', project_ids[0]], ['description', 'ilike', phone]]],
-        {'fields': ['id', 'name', 'stage_id', 'create_date']}
-    )
-    
-    return [{
-        "ticket_id": t['id'],
-        "subject": t['name'],
-        "status": t['stage_id'][1] if t.get('stage_id') else "New",
-        "created_at": t['create_date']
-    } for t in tasks]
