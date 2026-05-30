@@ -122,6 +122,12 @@ def strip_html(text):
 def get_current_user(auth: HTTPAuthorizationCredentials = Security(security)):
     return verify_token(auth.credentials)
 
+def require_staff(user=Depends(get_current_user)):
+    # Agent acts as staff for Real Estate
+    if user.get("role") != "agent" and user.get("role") != "staff":
+        raise HTTPException(status_code=403, detail="Agent/Staff access required")
+    return user
+
 def get_tag_id(models, uid, tag_name):
     tag_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner.category', 'search', [[['name', '=', tag_name]]])
     if not tag_ids:
@@ -175,7 +181,7 @@ def list_properties(skip: int = 0, limit: int = 20):
     return res
 
 @app.post("/properties", response_model=Property, tags=["Properties"])
-def create_property(p: Property, user=Depends(get_current_user)):
+def create_property(p: Property, user=Depends(require_staff)):
     uid, models = get_odoo_models()
     categ_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.category', 'search', [[['name', '=', 'Real Estate']]])
     if not categ_ids:
@@ -196,7 +202,7 @@ def create_property(p: Property, user=Depends(get_current_user)):
 # ===========================================================================
 
 @app.get("/inquiries", response_model=List[Inquiry], tags=["Inquiries"])
-def list_inquiries(user=Depends(get_current_user)):
+def list_inquiries(user=Depends(require_staff)):
     uid, models = get_odoo_models()
     data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'crm.lead', 'search_read',
         [[]], {'fields': ['id', 'contact_name', 'phone', 'description', 'stage_id']}
@@ -227,7 +233,7 @@ def create_inquiry(i: Inquiry):
 # ===========================================================================
 
 @app.get("/dashboard/stats", tags=["Dashboard"])
-def get_stats(user=Depends(get_current_user)):
+def get_stats(user=Depends(require_staff)):
     uid, models = get_odoo_models()
     categ_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.category', 'search', [[['name', '=', 'Real Estate']]])
     return {

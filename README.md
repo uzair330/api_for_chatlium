@@ -1,6 +1,6 @@
 # Chatlium Odoo API Stack
 
-This project runs Odoo 19.0 with four FastAPI bridge services:
+This project runs Odoo 19.0 as a backend with four independent FastAPI microservices.
 
 | Service | Local URL | Docs |
 | --- | --- | --- |
@@ -10,110 +10,148 @@ This project runs Odoo 19.0 with four FastAPI bridge services:
 | Real Estate API | `http://localhost:8003` | `http://localhost:8003/docs` |
 | Odoo UI | `http://localhost:8069` | Odoo web interface |
 
-## Local Docker Compose
+---
 
-Use Docker Compose for local development. This starts PostgreSQL, Odoo, and all four API services.
+## 🛡️ API Authentication & Roles (RBAC)
 
-### Start
+All 4 APIs use **JWT Bearer Tokens** for authentication with strict Role-Based Access Control (RBAC):
 
+1. **Staff / Admin**: Has full access to *all* endpoints, including searching the user directory, viewing dashboards, and creating records (properties, patients, students, etc).
+   * **Login Endpoint**: `POST /token`
+   * **Credentials**: Use the master Odoo credentials (e.g., `api_user` / `api_password_123`).
+2. **Customer / End-User**: Has restricted access. Customers, Students, and Patients can only access public menus, place orders, view their own personal history, and submit support tickets. Attempting to access Staff endpoints returns a `403 Forbidden`.
+   * **Login Endpoint**: Service-specific (e.g., `POST /customer/login`, `POST /student/login`).
+
+*Note: Tokens expire after 60 minutes. Use the `POST /refresh` endpoint to exchange a valid Refresh Token for a new set of tokens.*
+
+---
+
+## 💻 1. Local Development (Docker Compose)
+
+Use Docker Compose for local development. This starts PostgreSQL, Odoo, and all four API services automatically using zero-latency local networking.
+
+### Start the Stack
 ```bash
 docker compose up -d
 ```
+*   **Check status**: `docker compose ps`
+*   **Follow API logs**: `docker compose logs -f api school-api hospital-api realestate-api`
+*   **Stop everything**: `docker compose down`
 
-Check status:
+### First-Time Local Odoo Setup
+Before API login and seed scripts work, you must create the Odoo database.
+1. Open the Odoo Database Manager: [http://localhost:8069/web/database/manager](http://localhost:8069/web/database/manager)
+2. Create a database using the values from your local `.env`:
+   * **Database Name:** `admin`
+   * **Email/Login:** `api_user`
+   * **Password:** `api_password_123`
+   * *(If Odoo asks for a master password, try `admin`)*
+3. Once logged into the Odoo UI, install the apps required by the APIs:
+   * **Point of Sale** (for Restaurant)
+   * **CRM & Sales** (for Real Estate)
+   * **Project & Calendar** (for Hospital)
+   * **eLearning** (for School)
 
+### Seed Dummy Data
+Once Odoo is set up and the apps are installed, you can seed dummy data to test the APIs. Run these commands:
+* **Restaurant**: `docker compose exec api python seed_data.py`
+* **School**: `docker compose exec school-api python seed_data.py`
+* **Hospital**: `docker compose exec hospital-api python seed_hospital.py`
+* **Real Estate**: `docker compose exec realestate-api python seed_estate.py`
+
+---
+
+## ☁️ 2. Cloud Deployment (Google Cloud Run + Cloud SQL)
+
+Cloud Run does not run `docker-compose.yml`. Each service must be deployed as its own container. Because Odoo requires sub-millisecond database latency to install plugins without timing out, this architecture uses **Google Cloud SQL (PostgreSQL 15)** natively integrated with Cloud Run.
+
+### Prerequisites
+* Install and authenticate `gcloud`: [https://cloud.google.com/sdk/docs/install](https://cloud.google.com/sdk/docs/install)
+* Enable required Google Cloud APIs:
+  ```bash
+  gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com sqladmin.googleapis.com
+  ```
+
+### Step A: Setup Cloud SQL (PostgreSQL 15)
+Create a managed PostgreSQL database in the same region as your Cloud Run instances.
+1. **Create Instance**:
+   ```bash
+   gcloud sql instances create odoo-postgres \
+     --database-version=POSTGRES_15 \
+     --tier=db-f1-micro \
+     --region=us-central1 \
+     --root-password="your-master-password"
+   ```
+2. **Create Database**:
+   ```bash
+   gcloud sql databases create admin --instance=odoo-postgres
+   ```
+3. **Create User**:
+   ```bash
+   gcloud sql users create api_user --instance=odoo-postgres --password="api_password_123"
+   ```
+4. **Get Connection Name** (You will need this for deployment):
+   ```bash
+   gcloud sql instances describe odoo-postgres --format="value(connectionName)"
+   # Save the output. It will look like: my-project:us-central1:odoo-postgres
+   ```
+
+### Step B: Setup Artifact Registry
+Create a repository to store the optimized Docker images:
 ```bash
-docker compose ps
+gcloud artifacts repositories create chatlium \
+  --repository-format docker \
+  --location us-central1
 ```
 
-Follow API logs:
+### Step C: Build and Deploy Odoo
+The Odoo custom image (`Odoo/Dockerfile`) contains a custom wrapper that resolves Cloud Run's port injection while ensuring seamless database connectivity.
+1. **Build Odoo Image**:
+   ```bash
+   gcloud builds submit --tag us-central1-docker.pkg.dev/YOUR_PROJECT_ID/chatlium/odoo-web:latest . -f Odoo/Dockerfile
+   ```
+2. **Deploy Odoo to Cloud Run**:
+   *(Replace `YOUR_PROJECT_ID` with your actual Google Cloud project ID)*
+   ```bash
+   gcloud run deploy odoo-web \
+     --image us-central1-docker.pkg.dev/YOUR_PROJECT_ID/chatlium/odoo-web:latest \
+     --region us-central1 \
+     --platform managed \
+     --allow-unauthenticated \
+     --port 8069 \
+     --add-cloudsql-instances YOUR_PROJECT_ID:us-central1:odoo-postgres \
+     --set-env-vars HOST=/cloudsql/YOUR_PROJECT_ID:us-central1:odoo-postgres,USER=api_user,PASSWORD=api_password_123
+   ```
+   *Once deployed, open the provided Cloud Run URL in your browser to verify Odoo starts and install required modules.*
 
-```bash
-docker compose logs -f api school-api hospital-api realestate-api
-```
+### Step D: Build and Deploy the API Services
+Deploy each FastAPI service individually. You must provide the Cloud Run URL for Odoo generated in Step C.
 
-Stop everything:
+**Example for Restaurant API**:
+1. **Build**:
+   ```bash
+   gcloud builds submit --tag us-central1-docker.pkg.dev/YOUR_PROJECT_ID/chatlium/restaurent-api:latest Restaurent_api
+   ```
+2. **Deploy**:
+   ```bash
+   gcloud run deploy restaurent-api \
+     --image us-central1-docker.pkg.dev/YOUR_PROJECT_ID/chatlium/restaurent-api:latest \
+     --region us-central1 \
+     --platform managed \
+     --allow-unauthenticated \
+     --port 8000 \
+     --set-env-vars ODOO_URL=https://odoo-web-<random-id>.run.app,ODOO_DB=admin,ODOO_USER=api_user,ODOO_PASSWORD=api_password_123,JWT_SECRET=supersecret123,SECRET_KEY=supersecret123
+   ```
+*(Repeat Step D for `School_api`, `Hospital_api`, and `RealEstate_api` changing the folder and service names accordingly).*
 
-```bash
-docker compose down
-```
+---
 
-### First-Time Odoo Setup
+## 🔐 Auth And Login Testing
 
-Before API login and seed scripts work, the Odoo database must exist.
+There is no general public signup endpoint in these APIs. Users and records are created in Odoo or by the seed scripts. The APIs authenticate those users and return JWT tokens.
 
-Open:
-
-```text
-http://localhost:8069
-```
-
-Odoo database manager:
-
-```text
-http://localhost:8069/web/database/manager
-```
-
-Create a database using the same values from `.env`:
-
-```text
-Database name: admin
-Email/Login: api_user
-Password: api_password_123
-```
-
-If Odoo asks for a master password, try:
-
-```text
-admin
-```
-
-The master password is for Odoo database management operations such as creating, duplicating, backing up, restoring, or deleting databases. It is separate from the Odoo user login password.
-
-Install the Odoo apps needed by the APIs:
-
-```text
-Point of Sale
-CRM
-Project
-Calendar
-eLearning
-Sales
-```
-
-Local `.env` defaults:
-
-```env
-ODOO_URL=http://web:8069
-ODOO_DB=admin
-ODOO_USER=api_user
-ODOO_PASSWORD=api_password_123
-JWT_SECRET=supersecret123
-SECRET_KEY=supersecret123
-```
-
-Official Odoo references:
-
-- Odoo 19 database management: https://www.odoo.com/documentation/19.0/administration.html
-- Odoo 19 on-premise database manager path: https://www.odoo.com/documentation/19.0/administration/on_premise.html
-- Official Odoo Docker image: https://hub.docker.com/_/odoo/
-
-## Auth And Login
-
-There is no general public signup endpoint in these APIs.
-
-Users and records are created in Odoo or by the seed scripts. The APIs authenticate those Odoo users or seeded records and return JWT tokens.
-
-### Staff Login
-
-All four APIs support staff login:
-
-```text
-POST /token
-```
-
-Body:
-
+### Staff Login (All APIs)
+**Request**: `POST /token`
 ```json
 {
   "username": "api_user",
@@ -121,278 +159,22 @@ Body:
 }
 ```
 
-In Swagger:
-
-1. Open one of the `/docs` URLs.
-2. Open `POST /token`.
-3. Click `Try it out`.
-4. Enter the JSON above.
-5. Copy the returned `access_token`.
-6. Click `Authorize`.
-7. Enter `Bearer <access_token>`.
-
-### Restaurant Customer Login
-
-After running the restaurant seed script:
-
-```text
-POST http://localhost:8000/customer/login
-```
-
-Body:
-
-```json
-{
-  "phone": "+123456789"
-}
-```
-
-### School Student Login
-
-After running the school seed script:
-
-```text
-POST http://localhost:8001/student/login
-```
-
-Body:
-
-```json
-{
-  "student_ref": "STU001"
-}
-```
-
-Other seeded student refs:
-
-```text
-STU002
-STU003
-```
-
-## Seed Dummy Data
-
-Run these commands after Odoo database creation and required app installation.
-
-Restaurant:
-
+### Quick Curl Tests (Local)
 ```bash
-docker compose exec api python seed_data.py
+# Restaurant
+curl -X POST http://localhost:8000/token -H "Content-Type: application/json" -d '{"username":"api_user","password":"api_password_123"}'
+
+# School
+curl -X POST http://localhost:8001/token -H "Content-Type: application/json" -d '{"username":"api_user","password":"api_password_123"}'
 ```
 
-School:
-
-```bash
-docker compose exec school-api python seed_data.py
-```
-
-Large school dataset:
-
-```bash
-docker compose exec school-api python seed_data_large.py
-```
-
-Hospital:
-
-```bash
-docker compose exec hospital-api python seed_hospital.py
-```
-
-Real Estate:
-
-```bash
-docker compose exec realestate-api python seed_estate.py
-```
-
-## Quick Curl Tests
-
-Restaurant staff login:
-
-```bash
-curl -X POST http://localhost:8000/token \
-  -H "Content-Type: application/json" \
-  -d '{"username":"api_user","password":"api_password_123"}'
-```
-
-School staff login:
-
-```bash
-curl -X POST http://localhost:8001/token \
-  -H "Content-Type: application/json" \
-  -d '{"username":"api_user","password":"api_password_123"}'
-```
-
-Hospital staff login:
-
-```bash
-curl -X POST http://localhost:8002/token \
-  -H "Content-Type: application/json" \
-  -d '{"username":"api_user","password":"api_password_123"}'
-```
-
-Real Estate staff login:
-
-```bash
-curl -X POST http://localhost:8003/token \
-  -H "Content-Type: application/json" \
-  -d '{"username":"api_user","password":"api_password_123"}'
-```
-
-## Google Cloud Run
-
-Cloud Run does not run `docker-compose.yml`. Deploy each container separately:
-
-- `odoo-web`
-- `restaurent-api`
-- `school-api`
-- `hospital-api`
-- `realestate-api`
-
-The Odoo Cloud Run image is defined at:
-
-```text
-Odoo/Dockerfile
-```
-
-It uses `odoo:19.0` and copies repo custom addons into:
-
-```text
-/mnt/extra-addons
-```
-
-The Odoo image is built with:
-
-```text
-cloudbuild-odoo.yaml
-```
-
-### Cloud Run Requirements
-
-Install and authenticate the Google Cloud CLI first.
-
-Enable required APIs:
-
-```bash
-gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com sqladmin.googleapis.com
-```
-
-Cloud Run does not include the local PostgreSQL container. Use Cloud SQL for PostgreSQL or another managed PostgreSQL database.
-
-For Cloud SQL, set:
-
-```bash
-export CLOUD_SQL_INSTANCE="<project>:<region>:<instance>"
-export ODOO_DB_USER="<postgres-user>"
-export ODOO_DB_PASSWORD="<postgres-password>"
-```
-
-When `CLOUD_SQL_INSTANCE` is set, the deploy script:
-
-- Deploys Odoo with `--add-cloudsql-instances`.
-- Sets Odoo `HOST` to `/cloudsql/<INSTANCE_CONNECTION_NAME>`.
-- Lets Odoo connect over the Cloud SQL Unix socket.
-
-For a non-Cloud SQL PostgreSQL provider, set:
-
-```bash
-export ODOO_DB_HOST="<postgres-host>"
-export ODOO_DB_USER="<postgres-user>"
-export ODOO_DB_PASSWORD="<postgres-password>"
-```
-
-### Cloud Run Environment
-
-Set the Odoo/API credentials:
-
-```bash
-export ODOO_DB="admin"
-export ODOO_USER="api_user"
-export ODOO_PASSWORD="api_password_123"
-export JWT_SECRET="<secure-jwt-secret>"
-export SECRET_KEY="<secure-jwt-secret>"
-```
-
-Optional Artifact Registry repository name:
-
-```bash
-export AR_REPOSITORY="chatlium"
-```
-
-Images are pushed to:
-
-```text
-<region>-docker.pkg.dev/<project>/<repository>/<service>:latest
-```
-
-### Deploy To Cloud Run
-
-```bash
-chmod +x deploy-to-cloud-run.sh
-./deploy-to-cloud-run.sh <GCP_PROJECT> [REGION]
-```
-
-Example:
-
-```bash
-export CLOUD_SQL_INSTANCE="my-project:us-central1:odoo-postgres"
-export ODOO_DB_USER="odoo"
-export ODOO_DB_PASSWORD="<postgres-password>"
-export ODOO_DB="admin"
-export ODOO_USER="api_user"
-export ODOO_PASSWORD="api_password_123"
-export JWT_SECRET="<secure-jwt-secret>"
-export SECRET_KEY="<secure-jwt-secret>"
-./deploy-to-cloud-run.sh my-project us-central1
-```
-
-After deploy, open the `odoo-web` Cloud Run URL, create the Odoo database, install required apps, then run seed scripts from local containers or one-off Cloud Run jobs if needed.
-
-For Cloud Run, the Odoo database manager URL is:
-
-```text
-https://<odoo-web-cloud-run-url>/web/database/manager
-```
-
-Use that page to create, duplicate, backup, restore, or delete Odoo databases. The database name should match `ODOO_DB`, for example `admin`.
-
-Cloud Run container storage is ephemeral. For production Odoo file storage and attachments, use a persistent storage strategy instead of relying on files written inside the container.
-
-Official Google Cloud references:
-
-- Cloud Run container runtime contract: https://docs.cloud.google.com/run/docs/container-contract
-- Cloud Run environment variables: https://cloud.google.com/run/docs/configuring/services/environment-variables
-- Connect Cloud Run to Cloud SQL for PostgreSQL: https://cloud.google.com/sql/docs/postgres/connect-run
-- Artifact Registry Docker repositories: https://cloud.google.com/artifact-registry/docs/docker/store-docker-container-images
-
-## Troubleshooting
-
-If API login or seed scripts fail with:
-
-```text
-database "admin" does not exist
-```
-
-Create the Odoo database in the Odoo UI first.
-
-If a seed script fails with a missing Odoo model, install the matching Odoo app:
-
-- Restaurant needs Point of Sale.
-- School LMS needs eLearning.
-- Hospital needs Project and Calendar.
-- Real Estate needs CRM and Sales.
-
-Local checks:
-
-```bash
-docker compose ps
-docker compose logs web
-docker compose logs api school-api hospital-api realestate-api
-```
-
-Cloud Run checks:
-
-```bash
-gcloud run services list
-gcloud run services describe odoo-web --region <REGION>
-gcloud run services logs read odoo-web --region <REGION>
-```
+---
+
+## ⚠️ Troubleshooting
+
+*   **Database "admin" does not exist**: Create the Odoo database in the Odoo UI first before running seed scripts.
+*   **Seed script fails with missing model**: Ensure you have installed the correct matching Odoo app from the UI (e.g., Point of Sale for Restaurant).
+*   **Cloud Run Errors**: 
+    ```bash
+    gcloud run services logs read odoo-web --region us-central1
+    ```

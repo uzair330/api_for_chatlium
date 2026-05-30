@@ -158,6 +158,11 @@ def strip_html(text):
 def get_current_user(auth: HTTPAuthorizationCredentials = Security(security)):
     return verify_token(auth.credentials)
 
+def require_staff(user=Depends(get_current_user)):
+    if user.get("role") != "staff":
+        raise HTTPException(status_code=403, detail="Staff access required")
+    return user
+
 def get_tag_id(models, uid, tag_name):
     tag_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner.category', 'search', [[['name', '=', tag_name]]])
     if not tag_ids:
@@ -190,7 +195,7 @@ def refresh_token(auth: HTTPAuthorizationCredentials = Security(security)):
 # ===========================================================================
 
 @app.get("/patients", response_model=List[Patient], tags=["Patients"])
-def list_patients(skip: int = 0, limit: int = 20, user=Depends(get_current_user)):
+def list_patients(skip: int = 0, limit: int = 20, user=Depends(require_staff)):
     uid, models = get_odoo_models()
     tag_id = get_tag_id(models, uid, "Patient")
     data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'search_read',
@@ -204,7 +209,7 @@ def list_patients(skip: int = 0, limit: int = 20, user=Depends(get_current_user)
     ) for p in data]
 
 @app.post("/patients", response_model=Patient, tags=["Patients"])
-def create_patient(p: Patient, user=Depends(get_current_user)):
+def create_patient(p: Patient, user=Depends(require_staff)):
     uid, models = get_odoo_models()
     tag_id = get_tag_id(models, uid, "Patient")
     new_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'create', [{
@@ -342,7 +347,7 @@ def list_operations(user=Depends(get_current_user)):
 # ===========================================================================
 
 @app.get("/dashboard/stats", tags=["Dashboard"])
-def get_stats(user=Depends(get_current_user)):
+def get_stats(user=Depends(require_staff)):
     uid, models = get_odoo_models()
     p_tag = get_tag_id(models, uid, "Patient")
     d_tag = get_tag_id(models, uid, "Doctor")

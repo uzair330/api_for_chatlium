@@ -81,6 +81,11 @@ def verify_token(token: str):
 def get_current_user(auth: HTTPAuthorizationCredentials = Security(security)):
     return verify_token(auth.credentials)
 
+def require_staff(user=Depends(get_current_user)):
+    if user.get("type") != "staff" and user.get("role") != "staff":
+        raise HTTPException(status_code=403, detail="Staff access required")
+    return user
+
 # --- Odoo Helper ---
 def get_odoo_models(user=None, password=None):
     """Connects to Odoo. Uses provided credentials or system defaults."""
@@ -252,8 +257,8 @@ def get_loyalty_points(user=Depends(get_current_user)):
     }
 
 @app.get("/customers/search", tags=["Search"])
-def search_customers(query: str, user=Depends(get_current_user)):
-    """Search for customers by name, email, or phone"""
+def search_customers(query: str, user=Depends(require_staff)):
+    """Search for customers by name, email, or phone (Staff Only)"""
     uid, models = get_odoo_models()
     domain = ['|', '|', 
               ['name', 'ilike', query], 
@@ -275,7 +280,11 @@ def search_products(query: str, user=Depends(get_current_user)):
 
 @app.get("/orders/search", tags=["Search"])
 def search_orders(partner_id: Optional[int] = None, reference: Optional[str] = None, user=Depends(get_current_user)):
-    """Search for POS orders by partner or reference"""
+    """Search for POS orders by partner or reference. Customers can only see their own orders."""
+    # Enforce RBAC: If customer, they MUST only query their own partner_id
+    if user.get("type") != "staff" and user.get("role") != "staff":
+        if not partner_id or str(partner_id) != user.get("sub"):
+            raise HTTPException(status_code=403, detail="You can only search for your own orders")
     uid, models = get_odoo_models()
     domain = []
     if partner_id:

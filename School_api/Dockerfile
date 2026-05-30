@@ -1,5 +1,5 @@
 # Stage 1: Build stage
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
+FROM ghcr.io/astral-sh/uv:python3.12-alpine AS builder
 
 WORKDIR /app
 
@@ -17,7 +17,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --no-dev
 
 # Stage 2: Final runtime stage
-FROM python:3.12-slim-bookworm
+FROM python:3.12-alpine
 
 WORKDIR /app
 
